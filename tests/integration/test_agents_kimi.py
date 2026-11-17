@@ -1,11 +1,8 @@
 """Kimi Code, driven through `KimiCodeCLIAgent` against a stand-in `kimi web` on PATH.
 
-The stand-in is the daemon a Kimi agent drives: it prints the line saying where it listens,
-then serves the session REST routes on the loopback -- sessions, profiles, prompts, the status
-a turn is polled on, the history it is read back from, and the questions a turn stops on. It
-serves no `/ws`, so the driver reads every turn by polling, as it does against a daemon whose
-notifications it cannot reach. Started pointed at an endpoint by `KIMI_MODEL_*`, it asks that
-for the answer -- a local LiteLLM gateway, run for real, in front of an `Endpoint`.
+The stand-in prints its listening address and serves the current session REST routes. It
+serves no `/ws`, so ordinary turns use the driver's polling path. Started with `KIMI_MODEL_*`,
+it asks a local LiteLLM gateway, in front of an `Endpoint`, for its answer.
 """
 
 from __future__ import annotations
@@ -16,12 +13,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from hmz.coganchor import providers
-from hmz.coganchor.agents import (
-    Failed,
-    KimiCodeCLIAgent,
-    KimiCodeCLIAgentConfig,
-    Question,
-)
+from hmz.coganchor.agents import Failed, KimiCodeCLIAgent, KimiCodeCLIAgentConfig
 from hmz.coganchor.gateway import gatewayable
 from hmz.coganchor.providers import Provider
 from tests.integration.doubles_agents import (
@@ -46,13 +38,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 note()
 SESSIONS = itertools.count(1)
 PROMPTS = {}
-ASKED = {}
-
-
-def question(session):
-    return {"question_id": "q-" + session, "questions": [{
-        "id": "which", "header": "Which", "question": "Which way?",
-        "options": [{"id": "o-l", "label": "left"}, {"id": "o-r", "label": "right"}]}]}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -84,14 +69,7 @@ class Handler(BaseHTTPRequestHandler):
                                os.environ["KIMI_MODEL_API_KEY"],
                                os.environ["KIMI_MODEL_NAME"], said)
             PROMPTS[session] = said
-            if said == "ask":
-                ASKED[session] = question(session)
             self.reply({"prompt_id": "p-1", "user_message_id": "u-1", "status": "running"})
-        elif "/questions/" in path:
-            note(json.dumps({"session": session, "answered": sent["answers"]}))
-            ASKED.pop(session, None)
-            PROMPTS[session] = "answered " + json.dumps(sent["answers"], sort_keys=True)
-            self.reply({"resolved": True})
         else:
             self.reply({})
 
@@ -103,24 +81,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         session = parts[2]
         said = PROMPTS.get(session, "")
-        if path.endswith("/status"):
-            self.reply({"busy": session in ASKED})
-        elif path.endswith("/questions"):
-            self.reply({"items": [ASKED[session]] if session in ASKED else []})
-        elif path.endswith("/approvals"):
-            self.reply({"items": []})
-        elif path.endswith("/messages"):
-            if session in ASKED or not said:
-                self.reply({"items": []})
-                return
+        if path.endswith("/messages"):
             self.reply({"items": [{"id": "m-1", "role": "assistant", "content": [
                 {"type": "thinking", "thinking": "thinking about " + said},
                 {"type": "tool_use", "tool_name": "Shell"},
                 {"type": "text", "text": said}]}]})
-        else:
-            self.reply({"id": session, "usage": {"input_tokens": 30, "output_tokens": 10,
-                                                 "cache_read_tokens": 0,
-                                                 "cache_creation_tokens": 0}})
+        elif path.endswith("/agents/main/turns"):
+            turns = [{"turn_id": "t-1", "status": "ended", "outcome": "completed",
+                      "usage": {"input_other": 30, "output": 10,
+                                "input_cache_read": 0, "input_cache_creation": 0}}]
+            self.reply({"turns": turns, "has_more": False})
+        elif path == f"/sessions/{session}":
+            self.reply({"id": session, "busy": False, "main_turn_active": False,
+                        "usage": {"input_tokens": 0, "output_tokens": 0,
+                                  "cache_read_tokens": 0,
+                                  "cache_creation_tokens": 0}})
 
     def log_message(self, *ignored):
         pass
@@ -177,28 +152,6 @@ def test_one_daemon_holds_the_session_across_turns(kimi: Standins) -> None:
         ("session-1", "two"),
     ]
     assert agent.opened == ["session-1"]
-
-
-def test_a_question_the_turn_stopped_on_is_put_to_whoever_drives_it(
-    kimi: Standins,
-) -> None:
-    agent = KimiCodeCLIAgent(CONFIG)
-    asked: list[Question] = []
-
-    def answers(question: Question) -> str:
-        asked.append(question)
-        return "right"
-
-    agent.ask = answers
-
-    answered = agent.new()("ask")
-
-    assert [(one.text, one.options) for one in asked] == [
-        ("Which way?", ("left", "right"))
-    ]
-    assert json.loads(answered.removeprefix("answered ")) == {
-        "which": {"kind": "single", "option_id": "o-r"}
-    }
 
 
 def test_a_prompt_the_daemon_refuses_is_a_failed_turn_leaving_nothing_open(

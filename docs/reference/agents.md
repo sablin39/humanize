@@ -84,7 +84,7 @@ All classes are importable from `hmz.coganchor.agents`.
 | `cursor-agent` | `curl https://cursor.com/install -fsS \| bash` | not recorded |
 | `dsh` | `pip install 'deepseek-harness-sdk>=0.1.5rc1,<0.1.6' 'python-dotenv>=1.2.3'` (the `[dsh]` extra) | SDK `>=0.1.5rc1,<0.1.6` (`backends.DSH_SDK`) |
 | `grok` | `npm i -g @xai-official/grok` | 1.0.24 |
-| `kimi` | `npm i -g @moonshot-ai/kimi-code` (plus the `[kimi]` extra) | 0.42.0 |
+| `kimi` | `npm i -g @moonshot-ai/kimi-code` (plus the `[kimi]` extra) | 2.6.1, using the daemon protocol introduced in 2.5 |
 | `litellm` | `pip install 'litellm>=1.104'` (the `[litellm]` extra) | `>=1.104` (`backends.LITELLM_SDK`) |
 | `mcode` | `npm i -g @minimax-ai/code` | 0.5.9 |
 | `mimo` | `npm i -g @mimo-ai/cli` | not recorded |
@@ -997,7 +997,7 @@ A refusal reaches the agent only on a backend that waits for the answer:
 | `claude` | at `read-only` and `bypass`: `--permission-prompt-tool stdio` routes every request over the stream | yes at `bypass`; no at `read-only`; at the other rungs and with no rung nothing is routed |
 | `codex` | through the app server, at `auto` (`on-request`) and at any rung given `approvals` | yes at every rung; no with no rung |
 | `grok` | `session/request_permission`, on the held-open transport only | yes at every rung; no with no rung |
-| `kimi` | each approval on the daemon's `/approvals`: at `auto`, and at `read-only` or no rung | yes at `auto`; no at `read-only` and with no rung |
+| `kimi` | each approval interaction, answered on `/interactions/<id>`: at `auto`, and at `read-only` or no rung | yes at `auto`; no at `read-only` and with no rung |
 
 A hook can turn a yes into a no, never a no into a yes. Under a flow, Codex's refusal carries
 no reason, so the reason is steered into the turn instead.
@@ -1147,7 +1147,7 @@ for under a spent allowance raises `Stopped`. Clones and stand-ins spend the sam
 | `litellm` | input, output, cache_read, cache_write (cached reads taken out of input) | on the usage of the turn's one request |
 | `pi`, `omp` | input, output, cache_read, cache_write | on each finalised assistant message |
 | `opencode`, `mimo` | all five | on each step |
-| `kimi` | input, output, cache_read, cache_write | on each `turn.step.completed` notification |
+| `kimi` | input, output, cache_read, cache_write | on `turn.updated` and ended turns; the main agent's turn list is authoritative after recovery |
 | `cursor-agent`, `mcode` | input, output, cache_read, cache_write | once, on the closing `result` |
 | `agy` | input, output, cache_read, reasoning | never: usage is on the `result` event only |
 | `grok`, `qwen` | input, output, cache_read, cache_write | never: usage is on the `result` event only |
@@ -1817,11 +1817,17 @@ rung, thinking level and swarm width, and question ids.
 | `web_title` | `None` | `<dir> \| Kimi Code` | the web UI title |
 
 - Notifications wake the driver's REST polling (1 s without them); heartbeats are answered.
-- Usage comes from `turn.step.completed` (`inputOther`, `output`, `inputCacheRead`,
-  `inputCacheCreation`); the larger of the steps' sum and the session aggregate wins per kind.
+- Usage comes from `turn.updated` steps and ended turns (`input_other`, `output`,
+  `input_cache_read`, `input_cache_creation`). The main agent's `/agents/main/turns` list
+  supplies its totals even when a subscription is unavailable; a completed turn replaces its
+  running step total instead of counting it again. Child-agent subscriptions add their usage.
 - A turn is over when the session is seen stopped twice, a wait apart, after it was seen to
-  start. One whose `turn.ended` notification says `reason: failed` fails, with the daemon's
-  `error` message, rather than answering with nothing.
+  start. Overall `busy` keeps the turn alive while a child or background task is running. One
+  whose `turn.ended` notification says `outcome: failed` fails with the turn's `error` message,
+  rather than answering with nothing.
+- The profile alone sets `plan_mode`; prompts and steered prompts omit it. On the 2.5+
+  protocol, sending `plan_mode: false` in a read-only prompt leaves the session stuck waiting
+  for plan approval rather than running the requested turn.
 - The fence goes up once, when the daemon starts; another fence or account starts a new daemon.
   With `online=False`, the port is chosen before start and is the only one in `listen`, and
   `WebSearch`/`FetchURL` are in `disabled_tools` regardless of `web_search`.
