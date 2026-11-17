@@ -15,9 +15,9 @@ here at all -- would have nothing to write to. There is no per-turn body, so the
 runs at, its thinking level and its swarm width would have to be the process's own flags,
 fixed for the life of a prompt that is one turn long anyway, and ``--plan``/``--yolo``/``--auto``
 are the only three of them there are. And a turn that stops -- to ask, or for a tool it wants
-approving -- stops against a terminal there, not against an object with an id that something
-else can resolve; the daemon holds each on a route of its own -- ``/questions`` and
-``/approvals`` -- which is what lets a flow answer or refuse one with nobody at a keyboard.
+approving -- stops against a terminal there, not against an interaction with an id that
+something else can resolve through ``/interactions``. That is what lets a flow answer or
+refuse one with nobody at a keyboard.
 The server is the only surface in this CLI where a session is a thing
 rather than an invocation, so the daemon it is, and the cost of that choice -- one ``kimi web``
 per agent, and its argv -- is paid below.
@@ -158,42 +158,8 @@ _FORKED = re.compile(r"Forked to (\S+)")
 #: Event-capable daemons need polling only as recovery while the model is thinking.
 _RECOVERY_SECONDS = 10.0
 
-#: The lowest status a refused call carries. Below it is this driver's own number for a
-#: daemon that could not be reached or would not finish, which says nothing about the call.
-_REFUSED = 400
-
-#: The status a daemon answers with for a route it does not serve. Told apart from every
-#: other refusal because it is the one that is not about this session: a route that is not
-#: there is holding nothing, where a route that answered 500 is a route holding something
-#: nobody can read. The session's own troubles arrive inside a 200 -- `SESSION_NOT_FOUND`
-#: is an envelope with a code in it, which `call` raises with its own 1 -- so this catches
-#: the build and not the session.
-_ABSENT = 404
-
-#: The frames this daemon raises that a reader wakes for at once, and whether each may have
-#: left a question or an approval waiting to be answered. REST stays authoritative for what it
-#: will say; this only says which of its reads is worth the shared daemon's time now rather
-#: than on its own cadence -- and only those two are, because they are the two things a turn
-#: stops on. Whether a turn is still running is read a second apart whatever the daemon says,
-#: which
-#: is the cadence it was read at before there were notifications at all. What a turn has spent
-#: is read on that same second, but the figure it reads is the one carried here: the step
-#: frame below is the only place 0.42.0 says it at all, which is why this listener counts.
-#:
-#: A frame under no name here is coalesced instead of woken for: the daemon streams a running
-#: command's output and a tool call's arguments a chunk at a time, and a reader woken per
-#: chunk would spend the daemon every session of the agent shares on one session's `cat`. A
-#: question or an approval raised under a name that is not written down here is therefore
-#: found by the ordinary second, which is where it was found before any of this.
-_MEANS = {
-    "tool.call.started": False,
-    "prompt.started": False,
-    "goal.updated": False,
-    "turn.step.completed": False,
-    "event.question.requested": True,
-    "event.approval.requested": True,
-    "error": True,
-}
+#: Pending approvals and questions arrive as flat `interaction` frames. The daemon offers no
+#: REST list route, so these frames are both the wake-up and the authoritative payload.
 
 
 def _websockets(name: str) -> ModuleType:
@@ -226,22 +192,23 @@ def _update(socket: ClientConnection, deadline: float) -> dict[str, Any]:
 class _Updates:
     """Wake a session reader when its official daemon has something new to read.
 
-    REST remains authoritative for history, questions and goals. A refused subscription or a
-    lost connection returns to polling without resubmitting a prompt. It also says when the
-    one read a turn can be *stopped* on is due -- whether a question is waiting to be
-    answered. One daemon serves every session of its agent, so a reader that asked it
-    everything on every wake would be spending the time the other seven are queueing for on
-    answers nothing had changed; the rest keep their own second's cadence.
+    REST remains authoritative for history and goals. Pending approvals and questions arrive
+    as flat interaction frames, and are answered through their interaction ids. A lost
+    subscription falls back to polling history and usage without resubmitting the prompt.
 
-    Spending is the exception, and it is carried here rather than merely announced here: on
-    0.42.0 the step frames this listens to are the only place the daemon says what a request
-    cost at all, the session route having answered zero since the session opened. So this adds
-    each step up as it arrives and :meth:`KimiCodeCLISession._counting` reads the total on its
-    own second -- which is the cadence it always read on, with a figure in it now.
+    Spending is carried here rather than merely announced: each turn's completed total replaces
+    its running per-step figures. The REST turn list supplies the same totals on recovery or
+    when a subscription is unavailable; :meth:`KimiCodeCLISession._counting` reads both on its
+    usual second, without counting a completed turn's steps twice.
     """
 
     def __init__(
-        self, base: str, token: str, session: str, stepped: Counter[str]
+        self,
+        base: str,
+        token: str,
+        session: str,
+        turns: dict[tuple[str, str], Counter[str]],
+        steps: dict[tuple[str, str], dict[int, Counter[str]]],
     ) -> None:
         """Subscribes to one session of the daemon, falling back to polling if it cannot.
 
@@ -249,11 +216,8 @@ class _Updates:
           base: Where the daemon is listening.
           token: What it takes to be let in.
           session: The one session of it this listener carries, and the only one it counts.
-          stepped: That session's own running total, added to as each step of a turn lands.
-            The session's rather than this listener's, because a turn spends what the turns
-            before it spent as well: the meter is told the rise across a total, and a total
-            that started again at nothing every turn would show a rise only where a turn cost
-            more than the one before it.
+          turns: Each agent turn's latest cost, shared with the session's REST reads.
+          steps: Each running turn's per-step costs, replaced as notifications arrive.
         """
         # Loaded here rather than where this module is read, so that an install without
         # the `kimi` extra still holds every other backend. Before the try below, because
@@ -264,18 +228,17 @@ class _Updates:
         )
         self._failed = _failure()
         self._session = session
-        self._stepped = stepped
+        self._turns = turns
+        self._steps = steps
+        self._agents = {"main"}
         self._socket: ClientConnection | None = None
         self._contexts = contextlib.ExitStack()
         self.ended = False
         #: What the daemon said the last turn failed of, or "" for one that did not: a turn
         #: that failed stops the session as a turn that answered does, with nothing to say.
         self.failed = ""
-        #: Whether a question may be waiting to be answered. True to begin with and true
-        #: again whenever this listener stops carrying events: what is not being told is
-        #: asked for, which is the polling this backend ran on before there were
-        #: notifications at all.
-        self.questioned = True
+        #: A flat approval or question waiting for its response.
+        self.pending: list[dict[str, Any]] = []
         try:
             socket = self._contexts.enter_context(
                 connect(
@@ -285,8 +248,6 @@ class _Updates:
                     compression=None,
                     ping_interval=None,
                     open_timeout=1,
-                    # A full notification queue can delay its close handshake; REST has
-                    # already settled the turn, so disposing this listener needs little grace.
                     close_timeout=0.1,
                 )
             )
@@ -295,15 +256,18 @@ class _Updates:
                 json.dumps(
                     {
                         "type": "subscribe",
-                        "id": "hmz",
-                        "payload": {"session_ids": [session]},
+                        "request_id": "hmz",
+                        "session_id": session,
                     }
                 )
             )
             deadline = time.monotonic() + 1
             while True:
                 message = _update(socket, deadline)
-                if message.get("type") == "ack" and message.get("id") == "hmz":
+                if (
+                    message.get("type") == "response"
+                    and message.get("request_id") == "hmz"
+                ):
                     if message.get("code") != 0:
                         self.close()
                     break
@@ -314,10 +278,6 @@ class _Updates:
         """Wait for progress, falling back to ordinary polling after a disconnect."""
         socket = self._socket
         if socket is None:
-            # Nothing is being told, so everything is asked: this is the plain polling the
-            # backend ran on before there were notifications, and it asks the daemon the
-            # whole set every time round.
-            self.questioned = True
             time.sleep(_POLL_SECONDS)
             return
         # Keep the extra REST read after completion, without its polling delay once the
@@ -326,147 +286,151 @@ class _Updates:
             return
         started = time.monotonic()
         deadline = started + (_POLL_SECONDS if settled else _RECOVERY_SECONDS)
-        told = False  # whether the daemon said anything at all before the deadline
         try:
             while True:
                 message = _update(socket, deadline)
                 if message.get("type") == "ping":
-                    payload = message.get("payload")
-                    if not isinstance(payload, dict) or not isinstance(
-                        nonce := cast("dict[str, Any]", payload).get("nonce"), str
-                    ):
-                        self.close()
-                        return
-                    socket.send(
-                        json.dumps({"type": "pong", "payload": {"nonce": nonce}})
-                    )
+                    socket.send(json.dumps({"type": "pong"}))
                     continue
                 if message.get("session_id") != self._session:
                     continue
-                told = True  # a heartbeat says the daemon is there, not that this turn moved
                 kind = message.get("type")
-                payload = message.get("payload", {})
-                if not isinstance(payload, dict):
-                    self.close()
-                    return
-                main = cast("dict[str, Any]", payload).get("agentId", "main") == "main"
-                if kind == "turn.step.completed":
-                    # Counted here and nowhere else, because this frame is the only place the
-                    # daemon says what a request cost. Under this session's total and no
-                    # other: one `kimi web` serves every session of its agent and publishes
-                    # all of their frames down every socket, so a step is charged to the
-                    # session the daemon named on the frame -- which is the one this listener
-                    # subscribed to, everything else having been dropped above.
-                    #
-                    # Every agent of it, though, not only `main`: a swarm's members and a
-                    # delegated subagent run inside this session and their requests are this
-                    # session's bill. Each step is published once under the agent that took
-                    # it, so counting them all is counting them once.
-                    self._stepped.update(_spent(cast("dict[str, Any]", payload)))
-                if kind in ("assistant.delta", "thinking.delta"):
-                    # Preserve the old display cadence during long streaming messages,
-                    # coalescing token notifications into at most one history read/second.
-                    deadline = min(deadline, started + _POLL_SECONDS)
-                elif kind == "turn.started":
-                    # An agent beginning is not yet anything to read back: what it goes on
-                    # to do is, and that arrives under its own name.
+                payload = message
+                agent = str(message.get("agent_id") or "main")
+                main = agent == "main"
+                if kind == "task":
+                    child = str(message.get("child_agent_id") or "")
+                    if child and child != "main" and child not in self._agents:
+                        self._agents.add(child)
+                        socket.send(
+                            json.dumps(
+                                {
+                                    "type": "subscribe",
+                                    "request_id": f"hmz-{len(self._agents)}",
+                                    "session_id": self._session,
+                                    "agent_ids": [child],
+                                }
+                            )
+                        )
+                if kind in ("turn.started", "turn.ended"):
+                    turn = payload.get("turn")
+                    if isinstance(turn, dict):
+                        turn = cast("dict[str, Any]", turn)
+                        _remember_turn(
+                            self._turns,
+                            self._steps,
+                            str(message.get("agent_id") or "main"),
+                            turn,
+                        )
+                elif kind == "turn.updated":
+                    step = payload.get("step")
+                    if isinstance(step, dict):
+                        step = cast("dict[str, Any]", step)
+                        _remember_step(
+                            self._turns,
+                            self._steps,
+                            str(message.get("agent_id") or "main"),
+                            str(payload.get("turn_id") or ""),
+                            step,
+                        )
+                if kind == "turn.started":
                     if main:
                         self.ended, self.failed = False, ""
                 elif kind == "turn.ended":
                     if main:
                         self.ended = True
-                        ending = cast("dict[str, Any]", payload)
-                        if ending.get("reason") == "failed":
+                        ending = cast("dict[str, Any]", payload.get("turn") or {})
+                        if ending.get("outcome") == "failed":
                             self.failed = _erred(ending.get("error"))
                     return
-                elif (asks := _MEANS.get(str(kind))) is not None:
-                    self.questioned = self.questioned or asks
-                    # Progress is worth waking a running turn for. It is not worth cutting
-                    # short the grace a stopped one is given: a session reports stopped
-                    # before its last words can be read back, and a turn woken out of that
-                    # grace by the frame of the turn it is only now starting would answer
-                    # with what the daemon had not written down yet. Only `turn.ended`
-                    # above ends that wait early, because only it says the words are there.
+                elif kind == "interaction":
+                    named = str(message.get("interaction_id") or "")
+                    self.pending = [
+                        one
+                        for one in self.pending
+                        if one.get("interaction_id") != named
+                    ]
+                    if message.get("status") == "pending" and named:
+                        self.pending.append(message)
                     if not settled:
                         return
-                else:
-                    # Everything else this session is told is progress, whatever the daemon
-                    # calls it: a list of the frames worth waking for is a list that goes
-                    # stale, and a turn that stopped to ask under a name written down before
-                    # the daemon had it must still be read. So it is read back -- at the
-                    # cadence a stream of them can afford, which is the one the streamed
-                    # text already goes at and the one every read here falls back to.
+                elif kind == "turn.updated":
                     deadline = min(deadline, started + _POLL_SECONDS)
+                elif not settled:
+                    return
         except TimeoutError:
-            # Silence for as long as that is a listener that may have missed something, so
-            # the reader goes back to asking the daemon everything. A deadline reached with
-            # frames still arriving is not silence: it is the coalescing above, and what
-            # those frames meant has already been said.
-            if not told:
-                self.questioned = True
-            return  # Event delivery is never the only way to finish.
+            return  # REST polling is always available to finish the turn.
         except (OSError, self._failed, ValueError, TypeError):
             self.close()
 
     def close(self) -> None:
         """Release the subscription, including a partially completed handshake."""
-        # Said before the socket goes, so that a reader still in its turn asks the daemon
-        # everything from here on rather than trusting a listener that has stopped.
-        self.questioned = True
-        if self._socket is not None:
-            self._socket = None
-            with contextlib.suppress(OSError, self._failed):
-                self._contexts.close()
+        self._socket = None
+        with contextlib.suppress(OSError, self._failed):
+            self._contexts.close()
 
 
-#: What the daemon counts a session's spending in, and what each of those is here. Every kind
-#: of token counts: what a rate is measuring is the traffic, and a cache read crosses the wire
-#: like anything else.
-#:
-#: This is the session-level aggregate, and on 0.42.0 it is a promise the CLI does not keep.
-#: `GET /sessions/<id>` builds its body from one `toWireSession`, and that function writes
-#: `usage: emptySessionUsage()` -- four literal zeros -- whatever the session has spent. So the
-#: aggregate is read here still, because a build that ever starts keeping the promise should be
-#: believed, but it is read as a floor rather than as the truth: see :meth:`_counting`. A
-#: backend metered off this alone reports every turn as free, which is not a cosmetic wrong
-#: number -- a run allowance is a cap on what the meters say, so a backend that always says
-#: nothing is a backend no allowance can hold.
+#: Every kind of token counts. `input_other` excludes cached input, so adding these four
+#: fields accounts for all traffic exactly once.
 _KINDS = {
-    "input": "input_tokens",
-    "output": "output_tokens",
-    "cache_read": "cache_read_tokens",
-    "cache_write": "cache_creation_tokens",
+    "input": "input_other",
+    "output": "output",
+    "cache_read": "input_cache_read",
+    "cache_write": "input_cache_creation",
 }
 
-#: The same four kinds as one step of a turn reports them, which is where 0.42.0 actually says
-#: what it spent: `turn.step.completed` carries a `usage` object under these names, one frame
-#: per request to the model, and a turn is as many of them as the model took.
-#:
-#: The names differ from the aggregate's and so does one of the meanings, which is the whole
-#: trap here. `inputOther` is **not** the input: the CLI's own `inputTotal` is
-#: `inputOther + inputCacheRead + inputCacheCreation`, so `inputOther` is the part of the input
-#: that no cache served. That is exactly what :data:`hmz.coganchor.agents.event.KINDS` means by
-#: `input` -- the kinds there are counted so that adding them up is the whole of what crossed
-#: the wire, which they only are if the cached part is not also inside the input -- so the two
-#: line up kind for kind and nothing is added or taken away on the way across. The CLI agrees
-#: in its own code: its `toSnapshotUsage` fills `input_tokens` from `inputOther` and the two
-#: cache names from the two cache fields, which is this table and the one above being the same
-#: four numbers under two spellings. Getting it wrong the other way -- reading `inputOther` as
-#: the whole input, or adding the caches into it -- would report a turn at several times what
-#: it cost, and a wrong number is worse than no number because a wrong number looks right.
-_STEPPED = {
-    "input": "inputOther",
-    "output": "output",
-    "cache_read": "inputCacheRead",
-    "cache_write": "inputCacheCreation",
-}
+
+def _cost(turns: Mapping[tuple[str, str], Counter[str]]) -> Counter[str]:
+    """The latest cost of every turn this session has learned about."""
+    return sum(turns.values(), Counter[str]())
+
+
+def _remember_step(
+    turns: dict[tuple[str, str], Counter[str]],
+    steps: dict[tuple[str, str], dict[int, Counter[str]]],
+    agent: str,
+    turn: str,
+    step: Mapping[str, Any],
+) -> None:
+    """Replace a step's cost, keeping work still being retried out of the final total."""
+    if not turn:
+        return
+    current = steps.setdefault((agent, turn), {})
+    index = step.get("index")
+    at = int(index) if isinstance(index, (int, float)) else len(current)
+    current[at] = _spent(step)
+    turns[(agent, turn)] = sum(current.values(), Counter[str]())
+
+
+def _remember_turn(
+    turns: dict[tuple[str, str], Counter[str]],
+    steps: dict[tuple[str, str], dict[int, Counter[str]]],
+    agent: str,
+    turn: Mapping[str, Any],
+) -> None:
+    """Replace a turn's cost, rather than add another copy of it."""
+    named = agent, str(turn.get("turn_id") or "")
+    if not named[1]:
+        return
+    if turn.get("status") == "ended":
+        turns[named] = _spent(turn)
+        steps.pop(named, None)
+        return
+    current = steps.setdefault(named, {})
+    for index, step in enumerate(turn.get("steps") or []):
+        if not isinstance(step, dict):
+            continue
+        step = cast("dict[str, Any]", step)
+        at = step.get("index")
+        current[int(at) if isinstance(at, (int, float)) else index] = _spent(step)
+    turns[named] = sum(current.values(), Counter[str]())
 
 
 def _spent(payload: Mapping[str, Any]) -> Counter[str]:
     """What one completed step of a turn says it cost, by the kind this package counts in.
 
     Args:
-      payload: The body of a `turn.step.completed` frame.
+      payload: A turn or one of its steps, with an optional `usage` object.
 
     Returns:
       Its four counts, and nothing at all for a step that carried none -- `usage` is optional
@@ -480,7 +444,7 @@ def _spent(payload: Mapping[str, Any]) -> Counter[str]:
     return Counter(
         {
             kind: tokens
-            for kind, named in _STEPPED.items()
+            for kind, named in _KINDS.items()
             # Nothing below zero. A running total these are added into is a total a turn's
             # spending is the rise across, so one negative count would be this session buying
             # back tokens it had already been charged for -- and the rise it hid would never
@@ -500,23 +464,11 @@ _BLOCKS = {"text": "text", "thinking": "reasoning", "tool_use": "tool"}
 #: there and grows no further, so a turn that reaches for one says so as it reaches.
 _GROWS = ("text", "thinking")
 
-#: The two lists the daemon holds a stopped turn against, in the order a poll reads them.
-#: Both take the same `status=pending` querystring and both answer with their pending items
-#: under `items`, which is the whole of what :meth:`KimiCodeCLISession._held` needs to know.
-_HELD = ("questions", "approvals")
-
-#: What the daemon calls its approval list, and what an answer to one of them is. The route
-#: each turn that stops for a tool stops on: GET it with the `status=pending` its querystring
-#: schema requires and every unresolved approval of that session comes back under `items`,
-#: each one naming the tool (`tool_name`), the one line the CLI would have shown a person
-#: (`action`), the call itself (`tool_input_display`) and the id an answer goes back to
-#: (`approval_id`). The answer is a POST to that id, and its body is `decision` and three
-#: optional fields: `scope`, `feedback` and `selected_label`. `approved`, `rejected` and
-#: `cancelled` are the three decisions there are -- the first lets the tool run, and either of
-#: the others hands the model back a line saying the tool was not run, with whatever `feedback`
-#: said appended to it as the reason. Which is a turn that carries on having been refused
-#: rather than one that ends. Read off kap-server's own `routes/approvals.ts` and
-#: `protocol/approval.ts` in the 0.42.0 bundle.
+#: Approvals and questions are flat `interaction` frames. Pending ones are re-sent after
+#: every accepted subscription, and `/interactions/<id>` resolves them with their kind and
+#: the answer. An approval carries its tool, action and input in `request`; a question carries
+#: the questions and their options there instead. Resolution is one-shot rather than a stored
+#: session-wide grant: `scope` is deliberately omitted.
 #:
 #: `scope` is the one optional field with teeth, and it is left off deliberately. `session`
 #: there writes the approval down as a rule the session keeps, so every later call matching it
@@ -526,15 +478,8 @@ _HELD = ("questions", "approvals")
 #: the one field this driver has nothing to put in: it names which of the options a plan
 #: review offered was taken, and a plan review is a thing shown to a person.
 #:
-#: Read off the bundle and then asked of a real one -- a 0.42.0 `kimi web` started here with
-#: no model configured, which is enough to open a session and read the route if not to run a
-#: turn. It answers the filtered path `{"code": 0, "data": {"items": []}}`, the bare path
-#: `40001 status: Invalid input: expected "pending"`, an id it does not know `40404 approval
-#: nope not found`, and a decision it does not take `40001 decision: Invalid option: expected
-#: one of "approved"|"rejected"|"cancelled"`. Every one of those inside a 200, which is the
-#: thing the querystring dance below turns on: a route this daemon serves refuses in its
-#: envelope and never with a status of its own, so a status is the build answering and not
-#: the session.
+#: A rejected answer carries the reason to the model as a tool refusal, so the turn can
+#: continue without executing the command or waiting for somebody at a keyboard.
 _ANSWERS = ("approved", "rejected")
 
 #: How each rung of the ladder is set on a Kimi session. The daemon takes one of `manual`,
@@ -555,9 +500,9 @@ _ANSWERS = ("approved", "rejected")
 #: the plan and todo tools -- plus a `Write` or `Edit` inside a git worktree's own workspace.
 #: Bash asks, every time.
 #:
-#: Each of those is an approval and not a question, and until this driver read `/approvals`
-#: that made all three of the tighter modes unreachable: a turn stopped on one stayed busy
-#: with nothing on the route the poll was reading, and ended as the watchdog's stall. That is
+#: Each of those is an approval and not a question, and until this driver answered its
+#: interaction that made all three of the tighter modes unreachable: a turn stopped on one
+#: stayed busy with nothing being answered, and ended as the watchdog's stall. That is
 #: what :meth:`KimiCodeCLISession._approved` buys back, so the table below is the ladder
 #: rather than one rung written four times.
 #:
@@ -591,7 +536,7 @@ _ANSWERS = ("approved", "rejected")
 #: reasonable decision and continue without asking the user" -- so a turn at either of those
 #: two rungs does not stop to ask a person, and `NOTIFICATION` does not fire there. At
 #: `read-only` and `auto` it does: `AskUserQuestion` is approved by default under both `manual`
-#: and `yolo`, and `/questions` has always been read.
+#: and `yolo`, and question interactions are answered.
 #:
 #: What would make `read-only` bite harder still is a rung that cannot reach for `Bash` at
 #: all: no call to refuse is a fence, where an approval answered is a gate somebody has to
@@ -802,6 +747,14 @@ class _AppServer:
             )
         return said.get("data")
 
+    def busy(self, session: str) -> bool:
+        """Whether the session has a main turn, subagent, or background task running."""
+        route = f"/sessions/{session}"
+        held = self.call("GET", route)
+        if "busy" not in held:
+            raise Failed(1, self._argv, "", f"{route}: no session status in its answer")
+        return bool(held["busy"] or held.get("main_turn_active", False))
+
     def stop(self) -> None:
         """Takes the daemon and its children down, leaving its sessions on disk."""
         with self._stopping:
@@ -958,12 +911,10 @@ class KimiCodeCLISession(SessionBase):
         #: What this session has cost so far, by kind, as the daemon counts it: a running
         #: total for the whole conversation, so what one turn cost is the rise across it.
         self._counted: Counter[str] = Counter()
-        #: The same total as the daemon's own step frames have added it up, kept beside the
-        #: aggregate rather than instead of it because the two are read together. For the
-        #: whole conversation and not for one turn of it, for the reason above: the meter is
-        #: told a rise, and a total that started again at nothing each turn would report a
-        #: rise only where a turn cost more than the turn before it did.
-        self._stepped: Counter[str] = Counter()
+        #: Each agent turn's latest cost, for the whole conversation rather than one turn.
+        #: Running steps are replaced by their turn's final total rather than counted twice.
+        self._turn_usage: dict[tuple[str, str], Counter[str]] = {}
+        self._step_usage: dict[tuple[str, str], dict[int, Counter[str]]] = {}
         #: What the daemon was last told this session runs at, so a turn at the same
         #: settings does not tell it again -- and which daemon was told it. Both, because a
         #: profile is state that daemon holds rather than a fact about the session: an agent
@@ -972,29 +923,8 @@ class KimiCodeCLISession(SessionBase):
         #: turn running at the CLI's own settings instead of at this agent's.
         self._profile: dict[str, Any] = {}
         self._profiled: _AppServer | None = None
-        #: How this daemon takes each of the two pending lists. Its own querystring says
-        #: `status` is required on both, and a build that never had it refuses the same
-        #: thing; whichever answered is kept rather than found again every poll. Kept per
-        #: route rather than once for the daemon, because what the flip costs is not the
-        #: same on both: the unfiltered question list is the one that need not leave out
-        #: what has been answered already, so a hiccup on the approvals route moving the
-        #: question route onto it would have the flow answer an answered question again.
-        self._filter: dict[str, str] = dict.fromkeys(_HELD, "?status=pending")
-        #: Which of :data:`_HELD` this daemon turned out not to serve, so that a build
-        #: without one of them is asked once rather than twice a second forever. Both
-        #: spellings of a route answering 404 is the build saying it has no such route,
-        #: and a build does not grow one while a turn is running.
-        self._unserved: set[str] = set()
-        #: Every approval this session has already answered. The list the daemon holds is
-        #: its unresolved ones, so on 0.42.0 an answered approval is gone from it by the
-        #: time it is read again -- but nothing on the wire says so. An approval carries no
-        #: `status`: `toWireApproval` gives an id, the tool, the action, the call and two
-        #: timestamps, and the filtering is the server's own `findAll({resolved: false})`.
-        #: So a build that listed a resolved one anyway -- or a bare-path fallback onto a
-        #: list that does not leave them out -- would have this driver answer it a second
-        #: time, and a second answer is refused (`approval X already resolved`) every
-        #: second until the turn dies of it. Remembered here instead, which also keeps
-        #: `PERMISSION_REQUEST` at one firing per tool call rather than one per poll.
+        #: Interactions already answered: a later subscription replays pending interactions,
+        #: but the driver must not post a second answer or fire the hook twice.
         self._answered: set[str] = set()
         #: The skills the server last listed for this conversation, by name, as native
         #: entries: kept for when the daemon is down, and what a native turn is read against.
@@ -1068,7 +998,10 @@ class KimiCodeCLISession(SessionBase):
         queued = server.call(
             "POST",
             f"/sessions/{running.session}/prompts",
-            {"content": [{"type": "text", "text": text}], **running.config},
+            {
+                "content": [{"type": "text", "text": text}],
+                **{k: v for k, v in running.config.items() if k != "plan_mode"},
+            },
         )
         try:
             server.call(
@@ -1149,7 +1082,7 @@ class KimiCodeCLISession(SessionBase):
             while idle < (1 if seen else 2):
                 if self._cut:
                     raise Failed(1, server._argv, "", f"cut off: {self._cut}")
-                if server.call("GET", f"/sessions/{session}/status")["busy"]:
+                if server.busy(session):
                     seen, idle = True, 0
                 else:
                     idle += 1
@@ -1165,74 +1098,30 @@ class KimiCodeCLISession(SessionBase):
             )
             yield Event(kind="result", text="compacted", tokens=spent, spent=costing)
 
-    def _held(self, session: str, what: str) -> list[Any]:
-        """Whatever the daemon is holding on one of the two routes a turn stops against.
+    def _interact(self, session: str, updates: _Updates) -> None:
+        """Answer the pending questions and approvals carried by interaction frames.
 
-        The same reading for both: a filtered list whose spelling the daemon decides, and a
-        body that is either the list or the list under `items`.
-
-        Args:
-          session: The session the turn is running in.
-          what: Which of :data:`_HELD` to read.
-
-        Returns:
-          What is waiting there, which is nothing at all where the turn has not stopped.
-
-        Raises:
-          subprocess.CalledProcessError: If the daemon will not say either way.
+        The frames carry everything a response needs; there is no REST list to poll. Each is
+        answered once, and remains queued for the existing bounded retry if its answer fails.
         """
-        if what in self._unserved:
-            return []
-        server = self._running.server or self._agent.server
-        route = f"/sessions/{session}/{what}"
-        try:
-            held = server.call("GET", route + self._filter[what])
-        except subprocess.CalledProcessError as refusal:
-            # This daemon's querystring is `{status: "pending"}` and it refuses the bare
-            # path; one that has never heard of that filter refuses the other. Which way
-            # round it is, is the daemon's business -- but a turn waiting on an answer
-            # cannot be left holding a refusal, so the one is asked and then the other.
-            other = "" if self._filter[what] else "?status=pending"
-            try:
-                held = server.call("GET", route + other)
-            except subprocess.CalledProcessError as missing:
-                # Neither spelling, and at least one of them for want of the route rather
-                # than of an answer: this daemon does not serve it. Which is nothing held
-                # rather than something unreadable -- a build old enough to have no
-                # approvals route raises no approvals either, and failing its turns over a
-                # list it was never going to fill would be this reading costing what it
-                # exists to save. Written down rather than found again: one `kimi web`
-                # serves every session of its agent, and two refused calls a second on a
-                # route it will never grow is the shared daemon paying for a reading that
-                # cannot answer. Said once, and asked no more for the life of the session.
-                if _ABSENT in (refusal.returncode, missing.returncode):
-                    self._unserved.add(what)
-                    return []
-                raise
-            # Which one answered is kept, so that a poll a second is not a refusal a second
-            # on the daemon every session of the agent shares -- but only where the daemon
-            # refused with a status of its own, which a connection that dropped or a call
-            # that timed out never carries. A daemon that takes both spellings would
-            # otherwise be moved, by one hiccup, onto a list that need not leave out what
-            # has been answered already, and put an answered question again every second --
-            # which is not merely noisier than a wasted call but unrecoverable, since the
-            # flow has already acted on the first answer.
-            if refusal.returncode >= _REFUSED:
-                self._filter[what] = other
-        return (
-            cast("list[Any]", cast("dict[str, Any]", held).get("items") or [])
-            if isinstance(held, dict)
-            else cast("list[Any]", held or [])
-        )
+        pending, updates.pending = updates.pending, []
+        for interaction in pending:
+            named = str(interaction.get("interaction_id") or "")
+            if not named or named in self._answered:
+                continue
+            if interaction.get("kind") == "approval":
+                self._approved(session, interaction)
+            elif interaction.get("kind") == "question":
+                self._asked(session, interaction)
+            else:
+                continue
+            self._answered.add(named)
 
-    def _approved(self, session: str) -> None:
-        """Answers whatever the turn has stopped to have approved, and lets a hook refuse it.
+    def _approved(self, session: str, pending: dict[str, Any]) -> None:
+        """Answers an approval interaction, and lets a hook refuse it.
 
-        The other of the two things a turn stops on, and the one that used to stop it for
-        good: the daemon holds an approval until it is resolved, and a poll that read only
-        `/questions` left the session busy against a route nothing was answering. Every mode
-        but `auto` raises them, which is what makes the rungs above a ladder rather than one
-        setting written four times.
+        The daemon holds the tool until this interaction is resolved. Modes other than `auto`
+        can therefore pause here indefinitely unless the driver answers.
 
         Answered yes at the rungs that mean granting -- :data:`_GRANTED` -- because nobody is
         at a prompt there and the rung has already said what the agent may do. Answered no at
@@ -1253,103 +1142,93 @@ class KimiCodeCLISession(SessionBase):
 
         Args:
           session: The session the turn is running in.
+          pending: The flat approval frame, with its request under `request`.
 
         Raises:
-          subprocess.CalledProcessError: If the daemon will not say either way, for the same
-            reason a question that cannot be read is a turn that never ends.
+          subprocess.CalledProcessError: If the daemon refuses the answer.
         """
-        for raw in self._held(session, _HELD[1]):
-            pending = cast("dict[str, Any]", raw)
-            if not (approval := pending.get("approval_id")):
-                continue  # not an approval, whatever else the daemon answered with
-            if (named := str(approval)) in self._answered:
-                continue  # answered already, and the daemon takes one answer
-            self._answered.add(named)
-            asking = self._fire(
-                Moment.PERMISSION_REQUEST,
-                tool=str(pending.get("tool_name") or ""),
-                about=str(pending.get("action") or ""),
-                called=pending,
-            )
-            allowed, refused = _ANSWERS
-            if asking.refused:
-                answer = {
-                    "decision": refused,
-                    "feedback": asking.because or "refused by a hook",
-                }
-            elif (rung := self._agent.config.permission) in _GRANTED:
-                answer = {"decision": allowed}
-            else:
-                answer = {
-                    "decision": refused,
-                    "feedback": f"this agent runs at {rung}, which withholds approval"
-                    if rung
-                    else "nothing said what this agent may do",
-                }
-            (self._running.server or self._agent.server).call(
-                "POST", f"/sessions/{session}/approvals/{named}", answer
-            )
+        if not (named := pending.get("interaction_id")):
+            return
+        request = cast("dict[str, Any]", pending.get("request") or {})
+        asking = self._fire(
+            Moment.PERMISSION_REQUEST,
+            tool=str(request.get("tool_name") or ""),
+            about=str(request.get("action") or ""),
+            called=pending,
+        )
+        allowed, refused = _ANSWERS
+        if asking.refused:
+            answer = {
+                "decision": refused,
+                "feedback": asking.because or "refused by a hook",
+            }
+        elif (rung := self._agent.config.permission) in _GRANTED:
+            answer = {"decision": allowed}
+        else:
+            answer = {
+                "decision": refused,
+                "feedback": f"this agent runs at {rung}, which withholds approval"
+                if rung
+                else "nothing said what this agent may do",
+            }
+        (self._running.server or self._agent.server).call(
+            "POST",
+            f"/sessions/{session}/interactions/{named}",
+            {"kind": "approval", **answer},
+        )
 
-    def _asked(self, session: str) -> None:
-        """Answers whatever the turn has stopped to ask, if it has stopped to ask anything.
+    def _asked(self, session: str, pending: dict[str, Any]) -> None:
+        """Answers a question interaction, if the turn has stopped to ask anything.
 
-        The daemon holds a question until it is answered and the turn waits on it, so a poll
-        that only read messages would read a session that never moves again. An answer is
-        matched to one of the options where it names one, since a question that offered them
-        need not take anything else; a question nobody is there to answer is skipped, which
-        the tool reads as an answer and carries on from.
+        An answer is matched to an option label where possible. With nobody to answer, it is
+        skipped, which lets the tool carry on.
 
         Args:
           session: The session the turn is running in.
+          pending: The flat question frame, with its request under `request`.
 
         Raises:
-          subprocess.CalledProcessError: If the daemon will not say either way. A turn that
-            has stopped to ask and cannot be asked never moves again, so a turn whose caller
-            keeps getting this fails rather than polling on forever; one that gets it once
-            carries on, because a hiccup is not a daemon that has stopped answering.
+          subprocess.CalledProcessError: If the daemon refuses the answer.
         """
-        for raw in self._held(session, _HELD[0]):
-            pending = cast("dict[str, Any]", raw)
-            if not pending.get("question_id"):
-                continue  # not a question, whatever else the daemon answered with
-            answers: dict[str, dict[str, Any]] = {}
-            for asked in cast("list[Any]", pending.get("questions") or []):
-                question = cast("dict[str, Any]", asked)
-                offers: list[Any] = question.get("options") or []
-                options = {
-                    str(cast("dict[str, Any]", option).get("label", "")).lower(): cast(
-                        "dict[str, Any]", option
-                    ).get("id")
-                    for option in offers
-                    if isinstance(option, dict)
-                }
-                said = self._agent.asked(
-                    Question(
-                        text=str(
-                            question.get("question") or question.get("header") or ""
-                        ),
-                        options=tuple(
-                            str(cast("dict[str, Any]", option)["label"])
-                            for option in offers
-                            if isinstance(option, dict)
-                            and cast("dict[str, Any]", option).get("label")
-                        ),
-                    )
+        if not pending.get("interaction_id"):
+            return
+        answers: dict[str, dict[str, Any]] = {}
+        request = cast("dict[str, Any]", pending.get("request") or {})
+        for asked in cast("list[Any]", request.get("questions") or []):
+            question = cast("dict[str, Any]", asked)
+            offers: list[Any] = question.get("options") or []
+            options = {
+                str(cast("dict[str, Any]", option).get("label", "")).lower(): cast(
+                    "dict[str, Any]", option
+                ).get("id")
+                for option in offers
+                if isinstance(option, dict)
+            }
+            said = self._agent.asked(
+                Question(
+                    text=str(question.get("question") or question.get("header") or ""),
+                    options=tuple(
+                        str(cast("dict[str, Any]", option)["label"])
+                        for option in offers
+                        if isinstance(option, dict)
+                        and cast("dict[str, Any]", option).get("label")
+                    ),
                 )
-                if said is None:
-                    answers[str(question["id"])] = {"kind": "skipped"}
-                elif (chosen := options.get(said.strip().lower())) is not None:
-                    answers[str(question["id"])] = {
-                        "kind": "single",
-                        "option_id": chosen,
-                    }
-                else:
-                    answers[str(question["id"])] = {"kind": "other", "text": said}
-            (self._running.server or self._agent.server).call(
-                "POST",
-                f"/sessions/{session}/questions/{pending['question_id']}",
-                {"answers": answers},
             )
+            if said is None:
+                answers[str(question["id"])] = {"kind": "skipped"}
+            elif (chosen := options.get(said.strip().lower())) is not None:
+                answers[str(question["id"])] = {
+                    "kind": "single",
+                    "option_id": chosen,
+                }
+            else:
+                answers[str(question["id"])] = {"kind": "other", "text": said}
+        (self._running.server or self._agent.server).call(
+            "POST",
+            f"/sessions/{session}/interactions/{pending['interaction_id']}",
+            {"kind": "question", "answers": answers},
+        )
 
     def _cuts(self) -> None:
         """Aborts the prompt the turn is running, which is what stops a command it is in.
@@ -1385,15 +1264,10 @@ class KimiCodeCLISession(SessionBase):
         across it. Told to the meters as it is read, which is what a rate taken while the turn
         is still running is made of.
 
-        Two reckonings of the same conversation, and the larger of the two kind by kind. The
-        aggregate the session route answers with is one of them, and on 0.42.0 it is four
-        zeros forever (see :data:`_KINDS`); what its steps have said they cost is the other,
-        and on a build whose aggregate works the aggregate is the larger, being the whole
-        session's life rather than only the part of it this driver listened to. So the larger
-        is the most that can be accounted for either way -- and taking it that way round is
-        what stops an aggregate that is only ever zero from erasing counts that are real.
-        Larger is also what keeps the reading rising, which is what a rise across it can be
-        read from at all: a total that fell would be a turn's spending quietly dropped.
+        The session aggregate is zero on current Kimi Code. Main-agent totals come from its
+        turn list, which also recovers usage after a lost subscription; per-step frames and
+        subscribed child agents fill in work as it runs. Completed turn totals replace their
+        steps rather than adding another copy of them. Only the increase is reported.
 
         Args:
           server: The daemon holding the session.
@@ -1407,19 +1281,16 @@ class KimiCodeCLISession(SessionBase):
           subprocess.CalledProcessError: If the daemon will not say, which is not a failed
             turn: what a run costs is worth nothing at the price of the run.
         """
-        held = server.call("GET", f"/sessions/{session}")
-        usage: dict[str, Any] = (
-            cast("dict[str, Any]", held).get("usage") or {}
-            if isinstance(held, dict)
-            else {}
-        )
-        counted = Counter(
-            {
-                kind: tokens
-                for kind, named in _KINDS.items()
-                if (tokens := max(int(usage.get(named) or 0), self._stepped[kind])) > 0
-            }
-        )
+        page = server.call("GET", f"/sessions/{session}/agents/main/turns")
+        for one in cast("list[Any]", page.get("turns") or []):
+            if isinstance(one, dict):
+                _remember_turn(
+                    self._turn_usage,
+                    self._step_usage,
+                    "main",
+                    cast("dict[str, Any]", one),
+                )
+        counted = _cost(self._turn_usage)
         risen = Usage(
             {
                 kind: tokens
@@ -1512,15 +1383,14 @@ class KimiCodeCLISession(SessionBase):
         return found.group(1)
 
     def _told(self) -> tuple[dict[str, Any], dict[str, Any]]:
-        """What one turn of this session is run at, in the two halves the daemon takes it in.
+        """What one turn of this session runs at, in the profile and prompt halves.
 
         Two halves rather than one body because the two routes a turn is made of do not take
         the same keys. The session profile reads the model, the thinking level, the rung and
-        the width; the prompt body reads all of those and `disabled_tools` besides. Both are
-        `object()` schemas, which drop what they do not declare rather than refusing it, so
-        one body sent to both would be the web said to the profile and silently thrown away
-        -- and a driver relying on that silence is a driver that would never learn the key
-        had moved.
+        the width; the prompt reads those except `plan_mode`, plus `disabled_tools`. In
+        particular, `plan_mode: false` in a prompt does not leave read-only mode: the profile
+        alone changes that. Both are `object()` schemas, which drop undeclared keys rather
+        than refusing them, so filtering here matters more than what a request accepts.
 
         Returns:
           The settings both routes take, and beside them the ones only the prompt body has
@@ -1631,7 +1501,13 @@ class KimiCodeCLISession(SessionBase):
                         {"agent_config": profile},
                     )
                     self._profile, self._profiled = profile, server
-                updates = _Updates(server._base, server._token, session, self._stepped)
+                updates = _Updates(
+                    server._base,
+                    server._token,
+                    session,
+                    self._turn_usage,
+                    self._step_usage,
+                )
                 # Said before the prompt goes in, so that a word put in has a session to be
                 # steered into from the moment there is a turn to interrupt.
                 # The web is part of what the turn is running at rather than part of what the
@@ -1646,8 +1522,7 @@ class KimiCodeCLISession(SessionBase):
                     f"/sessions/{session}/prompts",
                     {
                         "content": [{"type": "text", "text": prompt}],
-                        **turn,
-                        **web,
+                        **{k: v for k, v in (turn | web).items() if k != "plan_mode"},
                         **({"skills": skills} if skills else {}),
                     },
                 )
@@ -1695,40 +1570,19 @@ class KimiCodeCLISession(SessionBase):
                             # been put down, which is a call that fails -- or, for one that
                             # asks the agent for its daemon, one that starts another.
                             raise Failed(1, server._argv, "", f"cut off: {self._cut}")
-                        # First of all: a turn that has stopped -- to ask, or to have a tool
-                        # approved -- waits on the answer, so a poll that only read messages
-                        # would be reading a session that has stopped moving. Asked at once
-                        # when the daemon has said there may be
-                        # something to answer, and a second apart when it has not: one daemon
-                        # serves every session of the agent, and asking it per notification what
-                        # it has already said it has none of is the one cost here that buys
-                        # nothing. Taken off the book before the reading rather than after, so
-                        # that a question raised while it runs is a question read next time
-                        # round rather than one this turn waits on forever. One refusal is a
-                        # hiccup on a daemon eight sessions are queueing on, not a turn to throw
-                        # minutes of work away over: it is carried on from and asked again on
-                        # the same second. A daemon that has refused it for a whole recovery
-                        # window has stopped answering it, and a question nobody can read is a
-                        # turn that never ends -- so that one is a failed turn.
-                        if due("asked", told=updates.questioned):
-                            updates.questioned = False
-                            # Both of them, every time, and neither behind the other: a
-                            # question and an approval are separate routes a turn can be
-                            # stopped on, and a daemon refusing one of them for a while
-                            # must not leave the other unread. So each is asked, and a
-                            # refusal is carried until both have been.
-                            stopped: subprocess.CalledProcessError | None = None
-                            for reading in (self._asked, self._approved):
-                                try:
-                                    reading(session)
-                                except subprocess.CalledProcessError as refusal:
-                                    stopped = stopped or refusal
-                            if stopped is None:
-                                refused = 0.0
-                            else:
+                        # Interactions are answered before anything else: the turn is waiting
+                        # on one, not merely streaming past it. An answer refused for a short
+                        # while is retried; one refused for a whole recovery window is a failed
+                        # turn rather than an unattended session waiting forever.
+                        if updates.pending or due("asked"):
+                            try:
+                                self._interact(session, updates)
+                            except subprocess.CalledProcessError:
                                 refused = refused or time.monotonic()
                                 if time.monotonic() - refused >= _RECOVERY_SECONDS:
-                                    raise stopped
+                                    raise
+                            else:
+                                refused = 0.0
                         # Whether it is still working, which is the reading a turn ends on --
                         # and the one read here that is made every time round, because it is
                         # also what paces the round. A session read as stopped is a wait of a
@@ -1736,7 +1590,7 @@ class KimiCodeCLISession(SessionBase):
                         # this on a cadence of its own would spend that second reading the
                         # history over and over instead of waiting the frames out. Measured, and
                         # written down in `bench/cli-concurrency/REJECTED.md`.
-                        busy = server.call("GET", f"/sessions/{session}/status")["busy"]
+                        busy = server.busy(session)
                         # What it has come to so far, asked for each time round rather than once
                         # at the end: a turn is minutes long, and a rate that only moved when one
                         # ended would stand still for all of them. A daemon that will not say is
@@ -1939,13 +1793,13 @@ class KimiCodeCLIAgent(AgentBase):
     """Kimi Code, driven through an app server of its own so a whole session is settable.
 
     Every moment a turn passes through, and one more: the daemon holds the tool it is about
-    to run on `/approvals` until somebody resolves it, and that is the one place a hook here
-    can say no to something and have the agent hear it.
+    to run on an approval interaction until somebody resolves it, and that is the one place
+    a hook here can say no to something and have the agent hear it.
     """
 
     #: Said of the backend and not of the rung, by the rule this repository settles the
     #: question with: a backend that holds a tool until its client answers is a backend where
-    #: this moment is real. Kimi holds it -- `/approvals` keeps the call, the turn waits, and
+    #: this moment is real. Kimi holds it -- the interaction keeps the call, the turn waits, and
     #: a `rejected` is a line the model reads -- so the moment is declared, once, for the
     #: class. What a given rung does with it is a fact about the run, the way a turn that
     #: calls no tool is a run in which `PRE_TOOL_USE` never arrives. :class:`Unhooked` is for

@@ -65,12 +65,16 @@ class _Daemon:
             },
         ]
     )
-    usage: dict[str, int] = field(
-        default_factory=lambda: {"input_tokens": 9, "output_tokens": 4}
+    ended: dict[str, Any] = field(
+        default_factory=lambda: {
+            "turn_id": "t-1",
+            "status": "ended",
+            "outcome": "completed",
+            "usage": {"input_other": 9, "output": 4},
+        }
     )
     questions: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
     approvals: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
-    ended: dict[str, Any] = field(default_factory=lambda: {"reason": "completed"})
     calls: list[tuple[str, str, Any]] = field(
         default_factory=list[tuple[str, str, Any]]
     )
@@ -101,11 +105,9 @@ class _Daemon:
             f"{at}/prompts": {"user_message_id": "u1", "prompt_id": "p1"},
         }
         gets: dict[str, Any] = {
-            at: {"usage": self.usage},
-            f"{at}/status": {"busy": False},
+            at: {"busy": False, "main_turn_active": False},
+            f"{at}/agents/main/turns": {"turns": [self.ended], "has_more": False},
             f"{at}/messages?after_id=u1": {"items": self.messages},
-            f"{at}/questions?status=pending": {"items": self.questions},
-            f"{at}/approvals?status=pending": {"items": self.approvals},
             f"{at}/goal": {"status": "completed"},
             f"{at}/skills": {"skills": self.skills},
         }
@@ -131,15 +133,23 @@ class _Daemon:
     def connect(self, url: str, **_: Any) -> _Socket:
         assert url == "ws://127.0.0.1:5494/api/v1/ws"
         events: list[dict[str, Any]] = [
-            {"type": "ack", "id": "hmz", "code": 0},
-            {"type": "ping", "payload": {"nonce": "n1"}},
+            {"type": "response", "request_id": "hmz", "code": 0},
+            {"type": "ping"},
+            *self.questions,
+            *self.approvals,
             {
-                "type": "turn.step.completed",
+                "type": "turn.updated",
                 "session_id": _SESSION,
-                "payload": {"usage": {"inputOther": 3, "output": 1}},
+                "agent_id": "main",
+                "turn_id": "t-1",
+                "step": {"index": 1, "usage": {"input_other": 3, "output": 1}},
             },
-            {"type": "turn.ended", "session_id": "someone-else", "payload": {}},
-            {"type": "turn.ended", "session_id": _SESSION, "payload": self.ended},
+            {
+                "type": "turn.ended",
+                "session_id": _SESSION,
+                "agent_id": "main",
+                "turn": self.ended,
+            },
         ]
         return _Socket(self, iter(events))
 
@@ -299,7 +309,7 @@ def test_a_turn_is_a_prompt_posted_and_the_messages_it_answers_with(
             "swarm_mode": False,
         }
     ]
-    assert {"type": "pong", "payload": {"nonce": "n1"}} in daemon.sent
+    assert {"type": "pong"} in daemon.sent
     assert [(one.kind, one.text) for one in events] == [
         ("reasoning", "hmm"),
         ("tool", "Shell"),
@@ -414,6 +424,8 @@ def test_the_session_profile_carries_how_the_agent_is_configured(
 
     (profile,) = daemon.posted(f"/sessions/{_SESSION}/profile")
     assert profile["agent_config"] == {"model": "kimi-k2", "swarm_mode": False, **told}
+    prompt = daemon.posted(f"/sessions/{_SESSION}/prompts")[0]
+    assert "plan_mode" not in prompt
 
 
 @pytest.mark.parametrize(
@@ -462,12 +474,19 @@ def test_an_approval_the_server_holds_is_answered_by_the_rung(
 ) -> None:
     del server
     daemon.approvals = [
-        {"approval_id": "ap1", "tool_name": "Shell", "action": "rm -rf"}
+        {
+            "type": "interaction",
+            "session_id": _SESSION,
+            "interaction_id": "ap1",
+            "status": "pending",
+            "kind": "approval",
+            "request": {"tool_name": "Shell", "action": "rm -rf"},
+        }
     ]
 
     _turn(made(permission=permission).new(tmp_path))
 
-    (answer,) = daemon.posted(f"/sessions/{_SESSION}/approvals/ap1")
+    (answer,) = daemon.posted(f"/sessions/{_SESSION}/interactions/ap1")
     assert answer["decision"] == decision
 
 
@@ -481,7 +500,14 @@ def test_a_hook_refusing_an_approval_rejects_it_at_a_granting_rung(
 ) -> None:
     del server
     daemon.approvals = [
-        {"approval_id": "ap1", "tool_name": "Shell", "action": "rm -rf"}
+        {
+            "type": "interaction",
+            "session_id": _SESSION,
+            "interaction_id": "ap1",
+            "status": "pending",
+            "kind": "approval",
+            "request": {"tool_name": "Shell", "action": "rm -rf"},
+        }
     ]
     seen: list[Occasion] = []
 
@@ -493,8 +519,8 @@ def test_a_hook_refusing_an_approval_rejects_it_at_a_granting_rung(
     agent.hooks.on(Moment.PERMISSION_REQUEST, refuse)
     _turn(agent.new(tmp_path))
 
-    assert daemon.posted(f"/sessions/{_SESSION}/approvals/ap1") == [
-        {"decision": "rejected", "feedback": "not that"}
+    assert daemon.posted(f"/sessions/{_SESSION}/interactions/ap1") == [
+        {"kind": "approval", "decision": "rejected", "feedback": "not that"}
     ]
     assert [(one.tool, one.about) for one in seen] == [("Shell", "rm -rf")]
 
@@ -507,13 +533,20 @@ def test_a_hook_saying_nothing_leaves_a_read_only_approval_rejected(
 ) -> None:
     del server
     daemon.approvals = [
-        {"approval_id": "ap1", "tool_name": "Shell", "action": "rm -rf"}
+        {
+            "type": "interaction",
+            "session_id": _SESSION,
+            "interaction_id": "ap1",
+            "status": "pending",
+            "kind": "approval",
+            "request": {"tool_name": "Shell", "action": "rm -rf"},
+        }
     ]
     agent = made(permission="read-only")
     agent.hooks.on(Moment.PERMISSION_REQUEST, lambda _occasion: Verdict())
     _turn(agent.new(tmp_path))
 
-    (answer,) = daemon.posted(f"/sessions/{_SESSION}/approvals/ap1")
+    (answer,) = daemon.posted(f"/sessions/{_SESSION}/interactions/ap1")
     assert answer["decision"] == "rejected"
 
 
@@ -536,14 +569,23 @@ def test_a_question_the_server_holds_is_put_to_whoever_drives_the_agent(
     del server
     daemon.questions = [
         {
-            "question_id": "q1",
-            "questions": [
-                {
-                    "id": "x",
-                    "question": "which one?",
-                    "options": [{"id": "o1", "label": "A"}, {"id": "o2", "label": "B"}],
-                }
-            ],
+            "type": "interaction",
+            "session_id": _SESSION,
+            "interaction_id": "q1",
+            "status": "pending",
+            "kind": "question",
+            "request": {
+                "questions": [
+                    {
+                        "id": "x",
+                        "question": "which one?",
+                        "options": [
+                            {"id": "o1", "label": "A"},
+                            {"id": "o2", "label": "B"},
+                        ],
+                    }
+                ]
+            },
         }
     ]
     agent = made()
@@ -558,8 +600,8 @@ def test_a_question_the_server_holds_is_put_to_whoever_drives_the_agent(
     _turn(agent.new(tmp_path))
 
     assert [(one.text, one.options) for one in asked] == [("which one?", ("A", "B"))]
-    assert daemon.posted(f"/sessions/{_SESSION}/questions/q1") == [
-        {"answers": {"x": chosen}}
+    assert daemon.posted(f"/sessions/{_SESSION}/interactions/q1") == [
+        {"kind": "question", "answers": {"x": chosen}}
     ]
 
 
@@ -570,7 +612,12 @@ def test_a_turn_the_server_says_failed_fails(
     tmp_path: Path,
 ) -> None:
     del server
-    daemon.ended = {"reason": "failed", "error": {"message": "the model fell over"}}
+    daemon.ended = {
+        "turn_id": "t-1",
+        "status": "ended",
+        "outcome": "failed",
+        "error": {"message": "the model fell over"},
+    }
 
     with pytest.raises(Failed) as failed:
         _turn(made().new(tmp_path))
@@ -638,7 +685,13 @@ def test_a_goal_that_fails_after_working_is_the_runs(
 ) -> None:
     del server
     monkeypatch.setenv(KEEPING, "off")
-    daemon.ended = {"reason": "failed", "error": {"message": "the model fell over"}}
+    daemon.ended = {
+        "turn_id": "t-1",
+        "status": "ended",
+        "outcome": "failed",
+        "error": {"message": "the model fell over"},
+        "usage": {"input_other": 9, "output": 4},
+    }
     agent = made()
     agent.epic = run = Run(tmp_path)
 
